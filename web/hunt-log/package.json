@@ -6,8 +6,9 @@
   "scripts": {
     "dev": "vite dev",
     "build": "vite build",
+    "postbuild": "tsc --target es2022 --module esnext --moduleResolution bundler --outDir build --skipLibCheck --rootDir src src/server.ts src/ws-upgrade.ts",
     "preview": "vite preview",
-    "start": "node build/index.js",
+    "start": "node build/server.js",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "test": "vitest run"
   },
