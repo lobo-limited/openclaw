@@ -198,6 +198,69 @@ function signWithPrivateKeyPem(privateKeyPem: string, payload: string): string {
 }
 
 // ===========================================================================
+// ClientFrame -> Gateway request translation (pure, unit-testable)
+// ===========================================================================
+
+export interface GatewayRequest {
+  type: "req";
+  id: string;
+  method: string;
+  params: Record<string, unknown>;
+}
+
+export interface TranslateContext {
+  /** Most recent open approval id, captured when a `decision-required`
+   * projection emerges. Used to resolve `decision` browser frames. */
+  lastApprovalId: string | null;
+  newId: () => string;
+}
+
+/**
+ * Translate a browser ClientFrame into a Gateway request envelope (or null
+ * when the frame has no immediate gateway-side effect — e.g. a `decision`
+ * arriving with no open approval).
+ *
+ * Separate from `send()` so unit tests don't need to build a live WS.
+ */
+export function translateClientFrame(
+  frame: ClientFrame,
+  ctx: TranslateContext,
+): GatewayRequest | null {
+  if (frame.type === "begin") {
+    return {
+      type: "req",
+      id: ctx.newId(),
+      method: "agent",
+      params: {
+        message: frame.brief,
+        agentId: "ops",
+        idempotencyKey: ctx.newId(),
+      },
+    };
+  }
+  if (frame.type === "interrupt") {
+    return {
+      type: "req",
+      id: ctx.newId(),
+      method: "chat.abort",
+      params: {},
+    };
+  }
+  if (frame.type === "decision") {
+    if (!ctx.lastApprovalId) return null;
+    // v0: `edit` collapses to `reject` (no edits path yet).
+    const decision = frame.action === "edit" ? "reject" : frame.action;
+    return {
+      type: "req",
+      id: ctx.newId(),
+      method: "exec.approval.resolve",
+      params: { id: ctx.lastApprovalId, decision },
+    };
+  }
+  return null;
+}
+
+// ===========================================================================
 // Event projection (Gateway wire → ServerFrame)
 // ===========================================================================
 
@@ -413,6 +476,10 @@ export async function connectGateway(): Promise<GatewayClient> {
   const mapper = createGatewayEventMapper();
   let nonce: string | null = null;
   let helloReceived = false;
+  // Task 13: track the most recent open approval id so the browser `decision`
+  // frame can resolve it via exec.approval.resolve. Captured when a
+  // `decision-required` projection emerges from the mapper.
+  let lastApprovalId: string | null = null;
 
   const cleanupTimers: NodeJS.Timeout[] = [];
   const clearAllTimers = () => {
@@ -493,7 +560,10 @@ export async function connectGateway(): Promise<GatewayClient> {
 
     // Everything else: project + emit if relevant.
     const projected = mapper.map(frame);
-    if (projected) emitServerFrame(projected);
+    if (projected) {
+      if (projected.type === "decision-required") lastApprovalId = projected.plateId;
+      emitServerFrame(projected);
+    }
   }
 
   return new Promise<GatewayClient>((resolve, reject) => {
@@ -603,29 +673,14 @@ export async function connectGateway(): Promise<GatewayClient> {
 
     const client: GatewayClient = {
       send(frame: ClientFrame): void {
-        // Task 13 owns the ClientFrame -> Gateway-request translation. For v0
-        // this is a stub: emit a `req` envelope so the BFF can iterate while
-        // the agent-request wiring is being built up.
-        if (frame.type === "begin") {
-          rawSend({
-            type: "req",
-            id: crypto.randomUUID(),
-            method: "agent",
-            params: {
-              message: frame.brief,
-              agentId: "ops",
-              idempotencyKey: crypto.randomUUID(),
-            },
-          });
-        } else if (frame.type === "interrupt") {
-          rawSend({
-            type: "req",
-            id: crypto.randomUUID(),
-            method: "chat.abort",
-            params: {},
-          });
-        }
-        // decision frames flow through Task 13's approval translator (TODO).
+        const req = translateClientFrame(frame, {
+          lastApprovalId,
+          newId: () => crypto.randomUUID(),
+        });
+        if (!req) return;
+        rawSend(req);
+        // One approval is one decision; clear so a stale id can't double-resolve.
+        if (frame.type === "decision") lastApprovalId = null;
       },
       onEvent(handler: (event: ServerFrame) => void): void {
         eventHandlers.push(handler);

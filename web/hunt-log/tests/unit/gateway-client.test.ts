@@ -11,6 +11,7 @@ import {
   createGatewayEventMapper,
   buildDeviceAuthSigningPayload,
   publicKeyRawBase64UrlFromPem,
+  translateClientFrame,
   type ServerFrame,
 } from "../../src/lib/gateway/client";
 
@@ -466,6 +467,79 @@ describe("publicKeyRawBase64UrlFromPem", () => {
     // base64url: no +, no /, no = padding; ed25519 raw = 32 bytes = ~43 chars
     expect(b64u).toMatch(/^[A-Za-z0-9_-]+$/);
     expect(b64u.length).toBe(43);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// translateClientFrame — browser ClientFrame -> Gateway request
+// ---------------------------------------------------------------------------
+
+describe("translateClientFrame", () => {
+  const newId = () => "fixed-id";
+
+  it("translates begin to an agent request carrying the brief", () => {
+    const req = translateClientFrame(
+      { type: "begin", brief: "do the thing", model: "m", repo: "r" },
+      { lastApprovalId: null, newId },
+    );
+    expect(req).toEqual({
+      type: "req",
+      id: "fixed-id",
+      method: "agent",
+      params: { message: "do the thing", agentId: "ops", idempotencyKey: "fixed-id" },
+    });
+  });
+
+  it("translates interrupt to chat.abort", () => {
+    const req = translateClientFrame({ type: "interrupt" }, { lastApprovalId: null, newId });
+    expect(req).toEqual({ type: "req", id: "fixed-id", method: "chat.abort", params: {} });
+  });
+
+  it("translates decision approve to exec.approval.resolve approve", () => {
+    const req = translateClientFrame(
+      { type: "decision", action: "approve" },
+      { lastApprovalId: "appr-9", newId },
+    );
+    expect(req).toEqual({
+      type: "req",
+      id: "fixed-id",
+      method: "exec.approval.resolve",
+      params: { id: "appr-9", decision: "approve" },
+    });
+  });
+
+  it("translates decision reject to exec.approval.resolve reject", () => {
+    const req = translateClientFrame(
+      { type: "decision", action: "reject" },
+      { lastApprovalId: "appr-9", newId },
+    );
+    expect(req).toEqual({
+      type: "req",
+      id: "fixed-id",
+      method: "exec.approval.resolve",
+      params: { id: "appr-9", decision: "reject" },
+    });
+  });
+
+  it("collapses decision edit to reject for v0 (no edits path yet)", () => {
+    const req = translateClientFrame(
+      { type: "decision", action: "edit", edits: "something" },
+      { lastApprovalId: "appr-9", newId },
+    );
+    expect(req).toEqual({
+      type: "req",
+      id: "fixed-id",
+      method: "exec.approval.resolve",
+      params: { id: "appr-9", decision: "reject" },
+    });
+  });
+
+  it("returns null for decision when there is no open approval", () => {
+    const req = translateClientFrame(
+      { type: "decision", action: "approve" },
+      { lastApprovalId: null, newId },
+    );
+    expect(req).toBeNull();
   });
 });
 
