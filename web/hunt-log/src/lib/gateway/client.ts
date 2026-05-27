@@ -37,8 +37,19 @@ const IDENTITY_DIR =
   process.env.OPENCLAW_IDENTITY_DIR ?? path.join(homedir(), ".openclaw", "identity");
 const CONNECT_TIMEOUT_MS = 10_000;
 const CLIENT_VERSION = "0.0.1";
-const CLIENT_NAME = "gateway-client"; // matches GATEWAY_CLIENT_IDS.GATEWAY_CLIENT
-const CLIENT_MODE = "backend"; // matches GATEWAY_CLIENT_MODES.BACKEND
+// Task 17: register as `cli`/`cli` (not `gateway-client`/`backend`). The
+// gateway-client/backend combo is OpenClaw's in-process trusted-helper
+// shortcut on loopback+token: it bypasses persistent pairing entirely
+// (shouldSkipLocalBackendSelfPairing → ensureDeviceToken returns null), so
+// the BFF would never receive a device-scoped token and could never be
+// independently revoked. `cli`/`cli` is silent-auto-paired by the gateway on
+// loopback+token (isCliContainerLocalEquivalent) and produces a real paired
+// device record we can name and revoke. Audit distinguishability comes from
+// `displayName: "Hunt Log BFF"` (preserved in clientPairingMetadata) and the
+// unique deviceId fingerprint.
+const CLIENT_NAME = "cli";
+const CLIENT_MODE = "cli";
+const CLIENT_DISPLAY_NAME = "Hunt Log BFF";
 const DEFAULT_ROLE = "operator";
 const DEFAULT_SCOPES = ["operator.admin"];
 
@@ -603,6 +614,7 @@ export async function connectGateway(): Promise<GatewayClient> {
                 version: CLIENT_VERSION,
                 platform,
                 mode: CLIENT_MODE,
+                displayName: CLIENT_DISPLAY_NAME,
               },
               caps: ["tool-events"],
               role: DEFAULT_ROLE,

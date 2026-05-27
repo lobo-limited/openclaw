@@ -96,3 +96,173 @@ Anything that breaks the spec contract becomes an issue against `lobo-limited/op
 - `/` returns SvelteKit HTML — ✓ (`<header class="topbar svelte-h6bux4">` present)
 - `/api/session` returns 426 — ✓ (`HTTP/1.1 426 Upgrade Required`)
 - `/api/session` with `Upgrade: websocket` headers returns 400 with `Missing or invalid Sec-WebSocket-Key header` — ✓ (proves WS handler is wired, just rejects malformed handshake)
+
+## BFF device pairing (Task 17, 2026-05-27)
+
+The Hunt Log BFF uses a dedicated ed25519 device identity at
+`~/.openclaw/identity-bff/`, distinct from the CLI's identity at
+`~/.openclaw/identity/`. This lets the gateway audit log distinguish BFF
+traffic from CLI traffic, lets BFF scopes be tightened independently, and
+lets the BFF be revoked without breaking the CLI.
+
+### Why `client.id="cli"`, not `"gateway-client"`
+
+The connect-params schema allows `client.id ∈ {webchat-ui, openclaw-control-ui,
+openclaw-tui, webchat, cli, gateway-client, openclaw-macos, openclaw-ios,
+openclaw-android, node-host, test, fingerprint, openclaw-probe}`.
+`gateway-client` / `backend` is the gateway's in-process trusted-helper
+shortcut: on loopback + shared-secret auth the gateway treats those
+connections as already trusted (`shouldSkipLocalBackendSelfPairing` in
+`message-handler-BcGv4xCP.js:494`), bypasses pairing entirely, and does NOT
+mint a device-scoped token. That makes the BFF unrevokable and audit-equal
+to any other shared-secret caller.
+
+`cli` / `cli` from loopback + shared-secret triggers
+`isCliContainerLocalEquivalent` → silent auto-approve, persistence in
+`pairedByDeviceId`, and a real `auth.deviceToken` in the `hello-ok`
+response. The BFF can then drop the shared secret and authenticate using
+only the deviceToken on every subsequent connect (see
+`resolveConnectAuthState` + `verifyDeviceToken`).
+
+Audit distinguishability comes from:
+
+- A unique deviceId (sha256 of the BFF's ed25519 public key).
+- `client.displayName: "Hunt Log BFF"` — preserved into the paired-device
+  metadata (`clientPairingMetadata.displayName` in
+  `message-handler-BcGv4xCP.js:1140`), surfaced in
+  `openclaw devices list --json` and in `gateway/ws` log lines.
+
+The BFF's `client.ts` was updated as part of this task (CLIENT_NAME / CLIENT_MODE
+/ CLIENT_DISPLAY_NAME constants, plus `client.displayName` added to the
+connect-params object).
+
+### Pairing commands used
+
+The pairing was performed once with a single-shot Node helper (`/tmp/pair-bff.mjs`,
+not committed) that mirrors the BFF's `connectGateway()` handshake to register
+the new device:
+
+1. Generate ed25519 keypair, write `~/.openclaw/identity-bff/device.json`
+   (mode 600). Same JSON shape the CLI uses: `{version:1, deviceId, publicKeyPem,
+privateKeyPem, createdAtMs}` where `deviceId = sha256-hex(rawEd25519PublicKey)`.
+2. Open `ws://127.0.0.1:18789`, wait for `connect.challenge`, sign the v3 device
+   payload (`v3|deviceId|cli|cli|operator|<scopes>|<signedAtMs>|<gatewayToken>|<nonce>|linux|`),
+   send `connect` req with `client.displayName="Hunt Log BFF"`, role `operator`,
+   scopes `[operator.admin, operator.read, operator.write]`, and
+   `auth: { token: <gateway shared secret> }`. The gateway shared secret is
+   required only for this first connect to satisfy pre-pairing auth; the BFF
+   never sees it again.
+3. The gateway silently auto-approves (loopback + cli/cli + shared-secret token
+   = `isCliContainerLocalEquivalent` locality), mints an operator deviceToken,
+   and returns it in `hello-ok.payload.auth.deviceToken`.
+4. The helper writes `~/.openclaw/identity-bff/device-auth.json` mode 600:
+   `{version:1, deviceId, tokens: {operator: {token, role, scopes, updatedAtMs}}}`.
+
+The helper never prints the privateKey or deviceToken to stdout — only file
+paths, the deviceId fingerprint, and token _lengths_. The runtime invocation
+recorded in the gateway log:
+
+```
+2026-05-27T16:17:39.227Z info gateway device pairing auto-approved
+device=bd3cfef91fda39512f4616a47eb2376aed13da0cd3ea26099fa13e3b294ca2d6
+role=operator
+```
+
+### Identity record (post-pair)
+
+`openclaw devices list --json` shows the BFF as a peer of the CLI:
+
+```json
+{
+  "deviceId": "bd3cfef91fda39512f4616a47eb2376aed13da0cd3ea26099fa13e3b294ca2d6",
+  "displayName": "Hunt Log BFF",
+  "platform": "linux",
+  "clientId": "cli",
+  "clientMode": "cli",
+  "role": "operator",
+  "scopes": ["operator.admin", "operator.read", "operator.write"],
+  "createdAtMs": 1779898659213,
+  "approvedAtMs": 1779898659213,
+  "tokens": [
+    {
+      "role": "operator",
+      "scopes": ["operator.admin", "operator.read", "operator.write"],
+      "createdAtMs": 1779898659213,
+      "lastUsedAtMs": 1779899017456
+    }
+  ]
+}
+```
+
+(Token value itself is redacted in CLI output. `tokens[0].lastUsedAtMs` is
+the BFF runtime's last connect — confirms the BFF is authenticating with
+the new identity.)
+
+### Smoke test result
+
+```bash
+OPENCLAW_IDENTITY_DIR=~/.openclaw/identity-bff PORT=8415 HOST=127.0.0.1 \
+  node web/hunt-log/build/server.js
+# In another shell, ws-connect to /api/session:
+NODE_ENV=development node /tmp/smoke-bff-ws.mjs   # sends a `begin` frame
+```
+
+- Server emits `Hunt Log listening on http://127.0.0.1:8415` and stays up.
+- Browser WS connects (`open` event fires).
+- BFF's outbound `connectGateway()` succeeds with the new identity (verified
+  via temporary debug logging; gateway-side `tokens[0].lastUsedAtMs` advanced).
+- No `GATEWAY_UNAVAILABLE` / `NOT_PAIRED` / `unauthorized` errors emitted.
+
+A separate verification script (`/tmp/verify-bff-identity.mjs`, not committed)
+also confirmed that the BFF identity can authenticate the gateway using
+**only** the deviceToken (no gateway shared secret), receive a `hello-ok`
+with `auth.deviceToken` re-issued, and call `health` successfully. This
+demonstrates the BFF will continue to work after the gateway shared secret
+is rotated.
+
+### Required scopes (granted)
+
+- `operator.admin` — required for `agent` calls and `exec.approval.resolve`.
+- `operator.read` — informational; granted.
+- `operator.write` — informational; granted.
+
+Tighter scopes are a v1 concern.
+
+### Revocation
+
+To revoke the BFF without affecting the CLI:
+
+```bash
+# Soft revoke (invalidate the token, keep the device record):
+openclaw devices revoke --device bd3cfef91fda39512f4616a47eb2376aed13da0cd3ea26099fa13e3b294ca2d6 --role operator
+
+# Hard remove (drop the paired device entry entirely):
+openclaw devices remove bd3cfef91fda39512f4616a47eb2376aed13da0cd3ea26099fa13e3b294ca2d6
+```
+
+After revocation, also delete the on-disk identity to prevent the BFF from
+re-pairing on the next start (any `cli/cli` connect from loopback would
+silently re-pair):
+
+```bash
+rm -rf ~/.openclaw/identity-bff
+```
+
+To re-issue (e.g. rotate the BFF token), repeat the pairing flow above.
+
+### Operator notes on `openclaw devices`
+
+- `openclaw devices` subcommands accept neither `--name`/`--display-name` nor
+  `--identity-dir`. There is no public CLI flag to "pair a different identity
+  directory" — the CLI only ever operates on its own identity at
+  `~/.openclaw/identity/`. New devices must register themselves via the
+  Gateway's `device.pair.*` RPC (effectively the `connect` handshake).
+- `openclaw devices approve` does not return the issued token in its JSON
+  output (the device-pair-approve RPC returns a redacted `device` summary).
+  Tokens are surfaced only via `device.token.rotate` (which the
+  `openclaw devices rotate` CLI exposes) or — for first-time auto-approved
+  pairings — directly in the `hello-ok.payload.auth.deviceToken` field of
+  the gateway's connect response.
+- `client.displayName` is the only audit-distinguishable, persisted metadata
+  field a new device can set at pair time. `client.id` and `client.mode` are
+  closed enums.
