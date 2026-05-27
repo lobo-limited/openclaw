@@ -1,0 +1,57 @@
+/* OpenClaw Hunt Log — global tokens
+   Lifted from design/openclaw-opencode-blessing/01-landing-openclaw/styles.css
+   See spec docs/superpowers/specs/2026-05-27-openclaw-hunt-log-design.md
+*/
+
+:root {
+  --obsidian:     #0A0A0B;
+  --gunmetal:     #1A1C1F;
+  --gunmetal-up:  #22252A;
+  --steel:        #3A4048;
+  --ash:          #7A7872;
+  --bone:         #E8E4DA;
+  --bone-bright:  #F5F2EA;
+  --cinnabar:     #C8412A;
+  --cinnabar-dim: #7A2818;
+
+  --grid:      8px;
+  --rule:      1px solid var(--steel);
+  --rule-fade: 1px solid #22252A;
+
+  --sans: "Space Grotesk", "Inter", system-ui, sans-serif;
+  --body: "Inter", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html { font-size: 16px; -webkit-text-size-adjust: 100%; }
+
+body {
+  background: var(--obsidian);
+  color: var(--bone);
+  font-family: var(--body);
+  font-size: 15px;
+  line-height: 1.55;
+  font-feature-settings: "tnum", "kern", "ss01";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::selection { background: var(--cinnabar); color: var(--bone-bright); }
+
+a { color: inherit; text-decoration: none; }
+
+code, kbd, pre {
+  font-family: var(--mono);
+}
+
+kbd {
+  font-size: 0.85em;
+  padding: 1px 5px;
+  border: 1px solid var(--steel);
+  border-radius: 2px;
+  color: var(--ash);
+}
