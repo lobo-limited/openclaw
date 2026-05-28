@@ -266,3 +266,134 @@ To re-issue (e.g. rotate the BFF token), repeat the pairing flow above.
 - `client.displayName` is the only audit-distinguishable, persisted metadata
   field a new device can set at pair time. `client.id` and `client.mode` are
   closed enums.
+
+## Verification 2 last-run (2026-05-28, automated headless)
+
+- **Browser:** Playwright + Chromium headless (chromium-headless-shell v1223).
+- **Target:** `http://127.0.0.1:8430` — a dev-mode hunt-log instance launched
+  with `NODE_ENV=development FORCE_AUTH=0 OPENCLAW_IDENTITY_DIR=~/.openclaw/identity-bff`
+  on a separate port so the production `hunt-log.service` on `:8410` was
+  unaffected.
+- **Initial result: FAIL.** Brief submitted, BFF accepted the WebSocket
+  upgrade and the browser sent the `begin` frame, but **zero frames ever
+  flowed back to the browser**. The page stayed on View I (BriefForm); the
+  URL never advanced to `/plate/<id>`; no trace elements rendered within
+  120 s.
+- **Trace count observed:** 0.
+- **Console errors observed:** none (the BFF was silent — there is no
+  observability at all in the WS-upgrade or gateway-client paths).
+- **What worked:**
+  - WS upgrade handshake (browser logged `[ws] open: ws://127.0.0.1:8430/api/session`).
+  - The browser sent the `begin` frame (captured via Playwright `framesent`).
+  - The dev-mode CF Access bypass took the `isDev` branch correctly (`web/hunt-log/src/ws-upgrade.ts:29`).
+
+### Root cause (confirmed empirically)
+
+Race condition in `web/hunt-log/src/ws-upgrade.ts` (lines 46–80, identical in
+`build/ws-upgrade.js` lines 41–90). Inside `wss.handleUpgrade(...)`'s async
+callback:
+
+```ts
+wss.handleUpgrade(request, socket, head, async (ws) => {
+  let gw: GatewayClient | null = null;
+  try {
+    gw = await connectGateway();        // ~100 ms await
+  } catch (e) { ... return; }
+  gw.onEvent((frame) => { ws.send(...) });    // attached AFTER the await
+  gw.onClose(...);
+  ws.on("message", (data) => { ... gw?.send(frame); });   // attached AFTER the await
+  ws.on("close", () => gw?.close());
+});
+```
+
+The `ws` socket is `OPEN` the moment `handleUpgrade` writes the 101 Switching
+Protocols response. The browser (`web/hunt-log/src/routes/+page.svelte:8-10`
+and `src/routes/plate/[id]/+page.svelte:17-30`) sends `{type:"begin",...}` in
+`ws.addEventListener('open', ...)` — i.e. immediately. That `message` arrives
+on the BFF socket **during the ~100 ms `await connectGateway()` window**, but
+`ws.on("message", ...)` has not yet been registered. Node's `EventEmitter`
+silently drops events with no listener, so the `begin` frame is lost. The
+gateway never sees an `agent` request, the BFF never emits a frame to the
+browser, and the UI sits forever on View I.
+
+### Discriminating test (proves the race)
+
+A node WS probe (`/tmp/hunt-log-e2e/probe.mjs`) connects to
+`ws://127.0.0.1:8430/api/session` and sends `begin`:
+
+- **Without delay:** 120 s → 0 frames received.
+- **With `setTimeout(() => ws.send(begin), 500)`:** frames flow normally —
+  `session` → `trace reply` → 8× `delta` → `complete` → `final` (outcome
+  `applied`). Excerpt of the first reply trace text concatenated from deltas:
+  `"Probe received, echoing back: connection test acknowledged."`.
+
+Direct in-process call of `connectGateway()` (bypassing the BFF entirely,
+`/tmp/hunt-log-e2e/connect-test.mjs`) also produced the full happy path,
+proving the gateway, BFF identity (`~/.openclaw/identity-bff`), `ops` agent,
+and `ollama/qwen3-30b-fast:latest` model are all healthy and not the cause.
+
+### Fix shape (NOT applied — out of scope for verification)
+
+Register the `ws.on("message", ...)` and `ws.on("close", ...)` listeners
+_before_ awaiting `connectGateway()`, and buffer any frames received during
+the connect window. Or: send a synthetic `connecting` ServerFrame on accept
+so the browser knows to defer, and only let it send `begin` after a `ready`
+frame. Either is a one-PR fix; the diagnosis above pins the exact lines.
+
+### Observability gap (separate concern)
+
+`web/hunt-log/src/ws-upgrade.ts` and `web/hunt-log/src/lib/gateway/client.ts`
+contain **zero `console.*` calls**. The hunt-log dev process logged only its
+startup line (`Hunt Log listening on http://127.0.0.1:8430`) across the
+entire failed verification. Future debugging of this class of bug will be
+just as painful as this session unless minimal connect/accept/error logging
+is added.
+
+## Verification 3 last-run (2026-05-28, automated)
+
+- **Outcome: SKIPPED (blocked by V2 race).** The decision flow cannot be
+  exercised end-to-end through the browser because the `begin` frame is
+  dropped before the agent run even starts. Re-test after the V2 race fix
+  lands. The SignatureCard projection itself (`exec.approval.requested` →
+  `decision-required` ServerFrame, `web/hunt-log/src/lib/gateway/client.ts:323-330`)
+  is wired and the `exec.approval.resolve` translation
+  (`translateClientFrame` decision branch, `client.ts:260-269`) is wired;
+  these were not stressed in this run.
+
+## Verification 4 last-run (2026-05-28, automated)
+
+- **Outcome: PASS at the BFF layer.** Test harness:
+  `/tmp/hunt-log-e2e/v4-reconnect.mjs`.
+- Connected to BFF, started a hunt (with the 500 ms workaround), got a
+  `{"type":"session","id":"agent:ops:main",...}` frame.
+- `systemctl --user stop openclaw-gateway` — within 100 ms the BFF emitted
+  `{"type":"error","code":"GATEWAY_DISCONNECTED","message":"gateway closed"}`
+  and closed the browser-facing WS (close code 1005). This proves the
+  `gw.onClose` handler (`web/hunt-log/src/ws-upgrade.ts:67-78`) and
+  `WebSocket "close"` projection in `client.ts:664-676` are working.
+- `systemctl --user start openclaw-gateway` + 4 s wait — a fresh WS connect
+  to the BFF produced a new `session` frame normally. No `--user`-level
+  state pollution.
+- The browser does have auto-reconnect with exponential backoff
+  (`src/routes/plate/[id]/+page.svelte:42-48`, `setTimeout(connect, backoffMs)`),
+  but this was exercised only at the WS-frame level here, not via a live
+  Playwright session, because of the V2 race.
+
+## Verification 5 (CF Access / tunnel)
+
+- **Outcome: SKIPPED.** Headless flow against `https://claw.handsomegato.link`
+  would require a Cloudflare Access service token (header
+  `CF-Access-Client-Id` / `CF-Access-Client-Secret`) provisioned for
+  `admin@handsomegato.com`. Not arranged in this session. The local
+  dev-mode bypass on `:8430` covered everything verifiable without it.
+
+## Summary — is Hunt Log v0 ready to mark PR #1 verified?
+
+**NOT YET.** Verification 2 (the golden path) currently fails for **every
+browser client** because of the listener-registration race in
+`web/hunt-log/src/ws-upgrade.ts:46-80`. The diagnosis is empirical
+(probe.mjs, connect-test.mjs, v4-reconnect.mjs in `/tmp/hunt-log-e2e/`) and
+the fix is small and local. V1, V4 (server-side), and BFF identity (Task 17)
+all check out independently. Once the race is fixed and V2 re-passes, V3 and
+the full V4 browser-side flow can be re-run with the existing harness; V5
+remains gated on the service-token provisioning question.
