@@ -1,5 +1,6 @@
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -16,6 +17,7 @@ import { resolveAgentIdByWorkspacePath, resolveDefaultAgentId } from "../agents/
 import { getRuntimeConfig, type OpenClawConfig } from "../config/config.js";
 import { isChatStopCommandText } from "../gateway/chat-abort.js";
 import type { CommandEntry } from "../gateway/protocol/index.js";
+import { resolveCommitHash } from "../infra/git-commit.js";
 import { registerUncaughtExceptionHandler } from "../infra/unhandled-rejections.js";
 import { setConsoleSubsystemFilter } from "../logging/console.js";
 import { loggingState } from "../logging/state.js";
@@ -26,11 +28,13 @@ import {
   parseAgentSessionKey,
 } from "../routing/session-key.js";
 import { normalizeLowercaseStringOrEmpty } from "../shared/string-coerce.js";
+import { VERSION } from "../version.js";
 import { getSlashCommands } from "./commands.js";
 import { ChatLog } from "./components/chat-log.js";
 import { CustomEditor } from "./components/custom-editor.js";
 import { GatewayChatClient } from "./gateway-chat.js";
 import { resolveLocalRunShutdownGraceMs } from "./local-run-shutdown.js";
+import { buildSplashLines, type SplashContext } from "./splash.js";
 import { editorTheme, theme } from "./theme/theme.js";
 import type { TuiBackend } from "./tui-backend.js";
 import { createCommandHandlers } from "./tui-command-handlers.js";
@@ -476,6 +480,50 @@ export function resolveTuiCtrlCAction(params: {
   return resolveCtrlCAction(params);
 }
 
+/**
+ * Shorten an absolute path to `~/...` when it lives under the user's home directory.
+ * Splash uses this so the project line reads as the operator wrote it.
+ */
+export function shortenHomePath(absolute: string, homeDir = os.homedir()): string {
+  if (!homeDir) {
+    return absolute;
+  }
+  if (absolute === homeDir) {
+    return "~";
+  }
+  const homeWithSep = homeDir.endsWith(path.sep) ? homeDir : homeDir + path.sep;
+  if (absolute.startsWith(homeWithSep)) {
+    return "~/" + absolute.slice(homeWithSep.length);
+  }
+  return absolute;
+}
+
+/**
+ * Build the synchronous SplashContext for {@link buildSplashLines} at TUI entry.
+ * Model and MCP-ready count are not synchronously known at entry — they fill in
+ * later via gateway events — so they render as "initializing" until then.
+ */
+export function buildSplashContextFromRuntime(params: {
+  version: string;
+  config: OpenClawConfig;
+  agentId: string;
+}): SplashContext {
+  const commit = resolveCommitHash({ moduleUrl: import.meta.url }) ?? "unknown";
+  const hostnameShort = (os.hostname() || "").split(".")[0] || "host";
+  const cwd = shortenHomePath(process.cwd());
+  const telemetry: "on" | "off" = params.config.diagnostics?.otel?.enabled === true ? "on" : "off";
+  return {
+    version: params.version,
+    commit,
+    hostnameShort,
+    cwd,
+    modelLabel: "initializing",
+    mcpReadyCount: "initializing",
+    agentId: params.agentId,
+    telemetry,
+  };
+}
+
 export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
   const isLocalMode = opts.local === true || opts.backend !== undefined;
   const config = opts.config ?? getRuntimeConfig({ skipPluginValidation: !isLocalMode });
@@ -742,6 +790,20 @@ export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
   root.addChild(statusContainer);
   root.addChild(footer);
   root.addChild(editor);
+
+  // Splash: emit at the top of the chat log before history loads, so it
+  // becomes the first content the user sees in their scroll-back. The 100ms
+  // micro-pause gives the user just enough breath to register the splash
+  // rendered before the prompt accepts input. See src/tui/splash.ts.
+  const splashContext = buildSplashContextFromRuntime({
+    version: VERSION,
+    config,
+    agentId: currentAgentId,
+  });
+  for (const line of buildSplashLines(splashContext)) {
+    chatLog.addSystem(line);
+  }
+  await new Promise<void>((resolve) => setTimeout(resolve, 100));
 
   const resolveDynamicSlashCommandsKey = () => currentAgentId;
 

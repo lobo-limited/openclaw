@@ -9,4 +9,6 @@ export const LOBSTER_PALETTE = {
   warn: "#FFB020",
   error: "#E23D2D",
   muted: "#8B7F77",
+  // rationed accent for the TUI splash; do not use elsewhere
+  brand_cut: "#C8412A",
 } as const;
