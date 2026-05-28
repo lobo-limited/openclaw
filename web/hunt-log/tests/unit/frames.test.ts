@@ -22,6 +22,24 @@ describe("frames: encode/decode", () => {
     expect(decoded).toEqual(frame);
   });
 
+  it("round-trips a begin frame with optional agent id", () => {
+    const frame: ClientFrame = {
+      type: "begin",
+      brief: "Refactor auth.go",
+      model: "nemotron3-nano:latest",
+      repo: "/home/lrjhr/cortejo-api",
+      agent: "hunt",
+    };
+    const decoded = decodeFrame(encodeFrame(frame));
+    expect(decoded).toEqual(frame);
+  });
+
+  it("rejects begin frames whose agent is the wrong type", () => {
+    expect(() =>
+      decodeFrame('{"type":"begin","brief":"b","model":"m","repo":"r","agent":42}'),
+    ).toThrow(/begin: agent must be string/i);
+  });
+
   it("round-trips a decision frame", () => {
     const frame: ClientFrame = { type: "decision", action: "approve" };
     expect(decodeFrame(encodeFrame(frame))).toEqual(frame);

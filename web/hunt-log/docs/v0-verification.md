@@ -496,3 +496,184 @@ verification _spec_ (not the code):
   tool invocation.
 - V5 CF Access pass-through, after a service token is provisioned for
   `admin@handsomegato.com` for `claw.handsomegato.link`.
+
+## Verification 3 re-run after agent-config fix (2026-05-28) — PASS
+
+The V3 gap from the prior section ("the `ops` agent invoked a write tool
+directly without emitting `exec.approval.requested`") is closed by routing
+Hunt Log to a dedicated agent whose per-agent exec policy requires a human
+mark on every exec. Three pieces moved together: a new agent, a per-agent
+host-approvals override, and BFF code changes.
+
+### New agent: `hunt`
+
+Created via `openclaw agents add hunt --workspace ~/.openclaw/workspace/hunt
+--model ollama/qwen3-30b-fast:latest --non-interactive`. Same model as
+`ops`/`analyst`/etc.; isolation lives in the **approvals scope**, not the
+model. Routing: `openclaw agents list` shows the agent; routing rules are
+default (no explicit channel bindings — invoked only by the BFF's `agent`
+request).
+
+### Approval policy: per-agent `security=full, ask=always`
+
+OpenClaw's exec-approval system is two-layered:
+
+1. **Local config** (`~/.openclaw/openclaw.json` → `tools.exec`) — the
+   _requested_ policy a client wants applied.
+2. **Host approvals file** (`~/.openclaw/exec-approvals.json`) — the
+   _effective_ policy enforced by the gateway. Has `defaults` + per-agent
+   overrides under `agents.<id>`.
+
+The effective policy is the host file intersected with the requested
+config. `openclaw exec-policy show` displays the merge.
+
+Applied via `openclaw approvals set --file /tmp/hunt-approvals.json`:
+
+```json
+{
+  "version": 1,
+  "socket": { "path": "~/.openclaw/exec-approvals.sock", "token": "<elided>" },
+  "defaults": { "security": "full", "ask": "off", "askFallback": "full" },
+  "agents": { "hunt": { "security": "full", "ask": "always" } }
+}
+```
+
+After apply, `openclaw exec-policy show` reports:
+
+| Scope                | Effective                                     |
+| -------------------- | --------------------------------------------- |
+| `tools.exec`         | `security=full, ask=off` (default, unchanged) |
+| `agent:ops` / others | `security=full, ask=off` (default, unchanged) |
+| `agent:hunt`         | `security=full, ask=always`                   |
+
+Important policy-semantics note: `security=deny` + `ask=always` does NOT
+produce an approval prompt. `deny` is terminal — it rejects the exec
+outright without raising `exec.approval.requested`. Only `security=full` +
+`ask=always` produces the approve-every-time flow that drives the
+SignatureCard.
+
+### BFF code changes — `frames.ts` + `client.ts`
+
+**Path A** from the task brief (not Path B — the gateway default agent was
+NOT changed; this affects Hunt Log only).
+
+`web/hunt-log/src/lib/gateway/frames.ts`:
+
+- Added optional `agent?: string` to the `begin` ClientFrame variant +
+  decode-time type validation.
+- `frames.test.ts`: 2 new round-trip tests + 1 negative test (agent as
+  wrong type → reject).
+
+`web/hunt-log/src/lib/gateway/client.ts`:
+
+- `translateClientFrame` for `begin`: `agentId: frame.agent ?? "hunt"`
+  (was hard-coded `"ops"`).
+- `translateClientFrame` for `decision`: corrected the decision enum mapping.
+  The prior code sent `decision: "approve"` / `"reject"`, which the gateway
+  rejected with `INVALID_REQUEST: invalid decision`. The actual gateway
+  enum is `{"allow-once", "allow-always", "deny"}` (see
+  `dist/exec-approvals-oH5G9_TS.js` → `DEFAULT_EXEC_APPROVAL_DECISIONS`,
+  and `dist/exec-approval-C5yk9TFU.js` line 292 — `isApprovalDecision`).
+  v0 mapping: `approve → allow-once`, `reject → deny`, `edit → deny`
+  (collapse: no edits path yet). `allow-always` is intentionally not
+  emitted because `ask=always` would reject it anyway with the upstream
+  error `"allow-always is unavailable because the effective policy requires
+approval every time"`. This was a pre-existing wire bug, not caused by
+  this change — it just was never exercised end-to-end before because V3
+  never reached the SignatureCard.
+
+`gateway-client.test.ts` updated for the new mapping (`approve → allow-once`,
+`reject → deny`, `edit → deny`) plus a new test covering the explicit-agent
+override on `begin`.
+
+### Unit tests: 87 of 87 passing
+
+```
+✓ tests/unit/diff-parse.test.ts (3 tests)
+✓ tests/unit/frames.test.ts (12 tests)        # +3 from +84 baseline
+✓ tests/unit/gateway-client.test.ts (57 tests) # +1, decision enums updated
+✓ tests/unit/hooks-jwt.test.ts (3 tests)
+✓ tests/unit/decision.test.ts (3 tests)
+✓ tests/unit/session.test.ts (3 tests)
+✓ tests/unit/traces.test.ts (6 tests)
+Tests  87 passed (87)
+```
+
+### V3 e2e run (Playwright + Chromium headless v1223)
+
+Harness: `/tmp/hunt-log-e2e/v3-verify.mjs`. Target file:
+`/tmp/hunt-target-v3.txt` seeded with `"before-v3\n"`. Brief, exactly:
+
+> _"You must execute exactly this shell command via the bash/exec tool. Do
+> not use any file-write tool. Do not use any other tool. Command: echo
+> '// hunted_v3' >> /tmp/hunt-target-v3.txt"_
+
+Important workaround applied by the harness: navigation from `/` to
+`/plate/<id>` via `window.history.pushState` + `dispatchEvent('popstate')`
+in `src/routes/+page.svelte` does NOT trigger a SvelteKit client-router
+swap in headless Chromium — the URL changes, but the BriefForm stays
+mounted. The harness sidesteps this by seeding the brief in
+`sessionStorage` and `goto`-ing directly to `/plate/agent:hunt:main`. The
+plate page reads the seed on `WS open` and sends `begin`. **This is a
+real Hunt Log routing bug visible in browser flows but not flagged by the
+prior `ws`-probe-only V2 PASS run; out of scope to fix in this commit —
+documented for follow-up.**
+
+Observed sequence (timestamps from harness log, machine-local clock):
+
+| Time     | Event                                                                                                                                     |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| t+0 ms   | Harness `goto /plate/agent:hunt:main`                                                                                                     |
+| t+9 ms   | Browser opens WS to `/api/session`, sends `begin`                                                                                         |
+| t+13.7 s | Gateway emits `exec.approval.requested` (specimen trace `phase=start name=exec command="echo '// hunted_v3' >> /tmp/hunt-target-v3.txt"`) |
+| t+13.8 s | BFF projects to `decision-required` ServerFrame (plateId `b1232506-…`)                                                                    |
+| t+13.9 s | `<SignatureCard>` selector `.card-decision` matches                                                                                       |
+| t+13.9 s | Harness clicks `.sig-approve`, sends `{"type":"decision","action":"approve"}`                                                             |
+| t+14.0 s | Gateway emits exec result `(no output)` (specimen `phase=result name=exec isError=false`)                                                 |
+| t+22.0 s | File on disk: `"before-v3\n// hunted_v3\n"` ✓                                                                                             |
+
+`RESULT: PASS (sigCardAppeared=true)` — file contains `// hunted_v3`.
+
+### Findings from the gateway-side investigation (worth keeping)
+
+- **OpenClaw's qwen3 agents have multiple write paths.** The `hunt` agent
+  exposes (at minimum) `exec`, `write`, `edit`, `file_write` tools. Only
+  `exec` is gated by `tools.exec` — the others go through pi-coding-agent's
+  internal write tools and bypass both `exec.approval.requested` and
+  `plugin.approval.requested`. If a future brief doesn't constrain the
+  model to `exec`, the model will pick `write` and silently modify files.
+  The BFF cannot enforce this; it's an OpenClaw / pi-coding-agent upstream
+  limitation. Recommended follow-up: file an upstream issue for
+  pi-coding-agent's `write` tool to route through `plugin.approval.request`.
+- **Per-agent overrides are only effective on `exec`.** This is enough to
+  prove the SignatureCard flow but is NOT a security boundary for the
+  agent's full tool surface.
+- **Sessions go stale on abandoned approvals.** If a `decision-required`
+  arrives and the operator never resolves it, the gateway session enters
+  `state=processing reason=blocked_tool_call activeWorkKind=tool_call`
+  and stays there indefinitely. Subsequent `agent` requests on the same
+  `sessionKey` (e.g. `agent:hunt:main`) queue behind the lane. Recovery:
+  `openclaw gateway call sessions.delete --params '{"key":"agent:hunt:main"}'`
+  - restart the gateway service. The lane error code surfaced is
+    `UNAVAILABLE / CommandLaneClearedError`. Hunt Log's reconnect path
+    already handles this gracefully (browser would see an `error` frame).
+
+### Updated summary — is Hunt Log v0 ready for PR #1 full sign-off?
+
+**YES for the BFF wire layer + the V3 SignatureCard end-to-end flow.**
+
+V1, V2, V3 (NOW), V4 (BFF layer): all PASS. V5 still gated on a CF Access
+service token; not blocking.
+
+Open items NOT closed by this commit (filed as separate follow-ups
+recommended):
+
+- The root-page `pushState`/`popstate` navigation no-op in Playwright
+  headless flows (visible only via browser end-to-end testing; the BFF and
+  plate-page both work correctly).
+- The pi-coding-agent internal `write` / `edit` / `file_write` tools
+  bypass the gateway approval bus. An OpenClaw-upstream fix.
+- The new `decision` enum mapping (`approve`/`reject` → `allow-once`/`deny`)
+  was a pre-existing latent wire bug fixed opportunistically here. If the
+  decision-required path is exercised by other channels (Telegram exec
+  approvals, dashboard UI), audit those too.

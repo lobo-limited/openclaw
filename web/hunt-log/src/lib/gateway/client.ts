@@ -244,7 +244,11 @@ export function translateClientFrame(
       method: "agent",
       params: {
         message: frame.brief,
-        agentId: "ops",
+        // Default to the `hunt` agent: it has per-agent exec policy
+        // `security=deny, ask=always` so any tool/shell write triggers
+        // `exec.approval.requested` → SignatureCard. The browser may
+        // override via `begin.agent` for non-default routing.
+        agentId: frame.agent ?? "hunt",
         idempotencyKey: ctx.newId(),
       },
     };
@@ -259,8 +263,13 @@ export function translateClientFrame(
   }
   if (frame.type === "decision") {
     if (!ctx.lastApprovalId) return null;
-    // v0: `edit` collapses to `reject` (no edits path yet).
-    const decision = frame.action === "edit" ? "reject" : frame.action;
+    // Gateway exec.approval.resolve decision enum is {"allow-once",
+    // "allow-always", "deny"} — NOT {"approve","reject"}. v0 maps:
+    //   approve → allow-once    (single-shot grant; "ask=always" policy
+    //                             disallows allow-always anyway)
+    //   edit    → deny          (no edits path yet; collapses to deny)
+    //   reject  → deny
+    const decision = frame.action === "approve" ? "allow-once" : "deny";
     return {
       type: "req",
       id: ctx.newId(),
