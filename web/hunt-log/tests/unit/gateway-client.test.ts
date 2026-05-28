@@ -477,9 +477,22 @@ describe("publicKeyRawBase64UrlFromPem", () => {
 describe("translateClientFrame", () => {
   const newId = () => "fixed-id";
 
-  it("translates begin to an agent request carrying the brief", () => {
+  it("translates begin to an agent request carrying the brief (defaults agentId='hunt')", () => {
     const req = translateClientFrame(
       { type: "begin", brief: "do the thing", model: "m", repo: "r" },
+      { lastApprovalId: null, newId },
+    );
+    expect(req).toEqual({
+      type: "req",
+      id: "fixed-id",
+      method: "agent",
+      params: { message: "do the thing", agentId: "hunt", idempotencyKey: "fixed-id" },
+    });
+  });
+
+  it("translates begin with explicit agent override", () => {
+    const req = translateClientFrame(
+      { type: "begin", brief: "do the thing", model: "m", repo: "r", agent: "ops" },
       { lastApprovalId: null, newId },
     );
     expect(req).toEqual({
@@ -495,7 +508,7 @@ describe("translateClientFrame", () => {
     expect(req).toEqual({ type: "req", id: "fixed-id", method: "chat.abort", params: {} });
   });
 
-  it("translates decision approve to exec.approval.resolve approve", () => {
+  it("translates decision approve to exec.approval.resolve allow-once", () => {
     const req = translateClientFrame(
       { type: "decision", action: "approve" },
       { lastApprovalId: "appr-9", newId },
@@ -504,11 +517,11 @@ describe("translateClientFrame", () => {
       type: "req",
       id: "fixed-id",
       method: "exec.approval.resolve",
-      params: { id: "appr-9", decision: "approve" },
+      params: { id: "appr-9", decision: "allow-once" },
     });
   });
 
-  it("translates decision reject to exec.approval.resolve reject", () => {
+  it("translates decision reject to exec.approval.resolve deny", () => {
     const req = translateClientFrame(
       { type: "decision", action: "reject" },
       { lastApprovalId: "appr-9", newId },
@@ -517,11 +530,11 @@ describe("translateClientFrame", () => {
       type: "req",
       id: "fixed-id",
       method: "exec.approval.resolve",
-      params: { id: "appr-9", decision: "reject" },
+      params: { id: "appr-9", decision: "deny" },
     });
   });
 
-  it("collapses decision edit to reject for v0 (no edits path yet)", () => {
+  it("collapses decision edit to deny for v0 (no edits path yet)", () => {
     const req = translateClientFrame(
       { type: "decision", action: "edit", edits: "something" },
       { lastApprovalId: "appr-9", newId },
@@ -530,7 +543,7 @@ describe("translateClientFrame", () => {
       type: "req",
       id: "fixed-id",
       method: "exec.approval.resolve",
-      params: { id: "appr-9", decision: "reject" },
+      params: { id: "appr-9", decision: "deny" },
     });
   });
 

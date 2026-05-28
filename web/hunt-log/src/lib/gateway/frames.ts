@@ -3,7 +3,7 @@
 // vice versa. See docs/gateway-frames.md for Gateway-side shapes.
 
 export type ClientFrame =
-  | { type: "begin"; brief: string; model: string; repo: string }
+  | { type: "begin"; brief: string; model: string; repo: string; agent?: string }
   | { type: "decision"; action: "approve" | "edit" | "reject"; edits?: string }
   | { type: "interrupt" };
 
@@ -45,7 +45,15 @@ export function decodeFrame(raw: string): Frame {
       if (typeof obj.brief !== "string") throw new Error("begin: missing brief");
       if (typeof obj.model !== "string") throw new Error("begin: missing model");
       if (typeof obj.repo !== "string") throw new Error("begin: missing repo");
-      return { type: "begin", brief: obj.brief, model: obj.model, repo: obj.repo };
+      if (obj.agent !== undefined && typeof obj.agent !== "string")
+        throw new Error("begin: agent must be string when present");
+      return {
+        type: "begin",
+        brief: obj.brief,
+        model: obj.model,
+        repo: obj.repo,
+        ...(typeof obj.agent === "string" ? { agent: obj.agent } : {}),
+      };
     case "decision":
       if (obj.action !== "approve" && obj.action !== "edit" && obj.action !== "reject")
         throw new Error("decision: invalid action");
