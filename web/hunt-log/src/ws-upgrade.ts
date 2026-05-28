@@ -43,11 +43,56 @@ export function attachWsUpgrade(server: Server): void {
       }
     }
 
+    const origin = request.headers.origin ?? "(no-origin)";
+    console.log(`[hunt-log/ws] upgrade accepted origin=${origin}`);
+
     wss.handleUpgrade(request, socket, head, async (ws) => {
       let gw: GatewayClient | null = null;
+      let ready = false;
+      const pending: string[] = [];
+
+      // Decode + dispatch a single client frame. Assumes gw is connected.
+      const dispatchClientFrame = (raw: string) => {
+        let frame;
+        try {
+          frame = decodeFrame(raw);
+        } catch (e) {
+          if (ws.readyState === ws.OPEN) {
+            console.log(`[hunt-log/ws] BAD_FRAME: ${(e as Error).message}`);
+            ws.send(
+              encodeFrame({ type: "error", code: "BAD_FRAME", message: (e as Error).message }),
+            );
+          }
+          return;
+        }
+        if (!isClientFrame(frame)) return;
+        gw?.send(frame);
+      };
+
+      // Register listeners BEFORE awaiting connectGateway() — browsers send
+      // `begin` on `open`, so frames arrive during the connect window and must
+      // be queued, not dropped by EventEmitter for lack of a listener.
+      ws.on("message", (data) => {
+        const raw = Buffer.isBuffer(data)
+          ? data.toString("utf8")
+          : Array.isArray(data)
+            ? Buffer.concat(data as Buffer[]).toString("utf8")
+            : data.toString();
+        if (ready && gw) {
+          dispatchClientFrame(raw);
+        } else {
+          pending.push(raw);
+        }
+      });
+
+      ws.on("close", () => {
+        gw?.close();
+      });
+
       try {
         gw = await connectGateway();
       } catch (e) {
+        console.log(`[hunt-log/ws] GATEWAY_UNAVAILABLE: ${(e as Error).message ?? String(e)}`);
         if (ws.readyState === ws.OPEN) {
           ws.send(
             encodeFrame({
@@ -66,6 +111,7 @@ export function attachWsUpgrade(server: Server): void {
       });
       gw.onClose(() => {
         if (ws.readyState === ws.OPEN) {
+          console.log("[hunt-log/ws] GATEWAY_DISCONNECTED");
           ws.send(
             encodeFrame({
               type: "error",
@@ -77,30 +123,10 @@ export function attachWsUpgrade(server: Server): void {
         }
       });
 
-      ws.on("message", (data) => {
-        const raw = Buffer.isBuffer(data)
-          ? data.toString("utf8")
-          : Array.isArray(data)
-            ? Buffer.concat(data as Buffer[]).toString("utf8")
-            : data.toString();
-        let frame;
-        try {
-          frame = decodeFrame(raw);
-        } catch (e) {
-          if (ws.readyState === ws.OPEN) {
-            ws.send(
-              encodeFrame({ type: "error", code: "BAD_FRAME", message: (e as Error).message }),
-            );
-          }
-          return;
-        }
-        if (!isClientFrame(frame)) return;
-        gw?.send(frame);
-      });
-
-      ws.on("close", () => {
-        gw?.close();
-      });
+      console.log(`[hunt-log/ws] connected gw, draining ${pending.length} buffered frames`);
+      ready = true;
+      for (const raw of pending) dispatchClientFrame(raw);
+      pending.length = 0;
     });
   });
 }
