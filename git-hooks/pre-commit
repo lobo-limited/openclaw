@@ -2,6 +2,9 @@
 
 set -euo pipefail
 
+# Ensure user-local binaries (node, npm, pnpm) are on PATH in hook context
+export PATH="$HOME/.local/bin:$PATH"
+
 ROOT_DIR="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 RUN_NODE_TOOL="$ROOT_DIR/scripts/pre-commit/run-node-tool.sh"
 FILTER_FILES="$ROOT_DIR/scripts/pre-commit/filter-staged-files.mjs"
